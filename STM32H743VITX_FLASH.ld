@@ -155,6 +155,15 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM_D1
 
+  /* SRAM3 section for DMA buffers (non-cached on H7) */
+  .sram3 (NOLOAD) :
+  {
+    . = ALIGN(32);
+    *(.sram3)
+    *(.sram3*)
+    . = ALIGN(32);
+  } >RAM_D2
+
   /* User_heap_stack section, used to check that there is enough RAM left */
   ._user_heap_stack :
   {
