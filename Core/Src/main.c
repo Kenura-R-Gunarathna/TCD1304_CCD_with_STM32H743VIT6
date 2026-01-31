@@ -19,12 +19,19 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+#define CCD_BUFFER_SIZE 3694 // 32 Dummies + 3648 Pixels + 14 Dummies
 
+#pragma pack(push, 1)
+typedef struct {
+  uint16_t magic;     // 0xABCD
+  uint16_t frame_num; // Rolling frame counter
+  uint16_t pixels[CCD_BUFFER_SIZE];
+} CCD_Frame_t;
+#pragma pack(pop)
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define CCD_BUFFER_SIZE 3694 // 32 Dummies + 3648 Pixels + 14 Dummies
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -55,6 +62,12 @@ __attribute__((section(".sram3"),
 volatile uint8_t frame_ready = 0; // Set by ICG interrupt when frame is complete
 volatile uint16_t *safe_buffer = Buffer_B; // Points to buffer safe to read
 uint16_t frame_counter = 0;
+CCD_Frame_t ccd_frame;
+
+// Mode Control
+volatile uint8_t ccd_mode = 0; // 0=Fast, 1=Stable(OneShot), 2=LongExposure
+volatile uint8_t mode_update_pending = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -75,20 +88,16 @@ static void MX_TIM5_Init(void);
 /* USER CODE BEGIN 0 */
 
 // ADC/DMA callback - not used in single buffer mode
+// ADC/DMA callback - Frame Complete
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef *hadc) {
-  // DMA runs continuously, ICG interrupt handles frame timing
+  if (hadc->Instance == ADC1) {
+    // Frame capture complete - copy to transmission buffer
+    ccd_frame.magic = 0xABCD;
+    ccd_frame.frame_num = frame_counter++;
+    memcpy(ccd_frame.pixels, (void *)Buffer_A, CCD_BUFFER_SIZE * 2);
+    frame_ready = 1;
+  }
 }
-
-// Binary frame structure for oscilloscope
-#pragma pack(push, 1)
-typedef struct {
-  uint16_t magic;     // 0xABCD
-  uint16_t frame_num; // Rolling frame counter
-  uint16_t pixels[CCD_BUFFER_SIZE];
-} CCD_Frame_t;
-#pragma pack(pop)
-
-CCD_Frame_t ccd_frame;
 
 // Send one frame of CCD data as binary (for oscilloscope)
 // Note: ccd_frame is already populated by TIM2 interrupt
@@ -190,8 +199,9 @@ int main(void) {
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
 
   // ========== SYNCHRONIZED STARTUP ==========
-  // Step 1: Start DMA FIRST (before any timers)
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)Buffer_A, CCD_BUFFER_SIZE);
+  // Step 1: DMA is NO LONGER started here. It will start on the first ICG
+  // interrupt. HAL_ADC_Start_DMA(&hadc1, (uint32_t *)Buffer_A,
+  // CCD_BUFFER_SIZE);
 
   // Step 2: Reset all timer counters to 0
   __HAL_TIM_SET_COUNTER(&htim2, 0);
@@ -202,11 +212,19 @@ int main(void) {
   // Step 3: Enable TIM2 update interrupt for ICG
   __HAL_TIM_ENABLE_IT(&htim2, TIM_IT_UPDATE);
 
-  // Step 4: Start all timers together (fM first, then others)
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1); // fM (master clock)
-  HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4); // ADC trigger
-  HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3); // SH
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1); // ICG (starts frame)
+  // Step 4: Start ONLY Master Clock (fM) running continuously
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+
+  // Initial Start for Continuous Modes (0 and 2)
+  if (ccd_mode != 1) {
+    // Start other timers for continuous mode
+    HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3); // SH
+    HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4); // ADC Trigger
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1); // ICG
+
+    // Start DMA Loop
+    HAL_ADC_Start_DMA(&hadc1, (uint32_t *)Buffer_A, CCD_BUFFER_SIZE);
+  }
 
   /* USER CODE END 2 */
 
@@ -214,11 +232,91 @@ int main(void) {
   /* USER CODE BEGIN WHILE */
   while (1) {
 
-    // Wait for ICG interrupt to signal frame is ready
-    if (frame_ready) {
-      frame_ready = 0;
-      Send_CCD_Frame_Binary();
+    // --- MODE SWITCHING LOGIC ---
+    if (mode_update_pending) {
+      mode_update_pending = 0;
+
+      // 1. Stop Everything
+      HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
+      HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_3);
+      HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_4);
+      HAL_ADC_Stop_DMA(&hadc1);
+
+      // 2. Reconfigure TIM5 (SH) based on mode
+      if (ccd_mode == 2) {
+        // Full Integration (Long Exposure)
+        __HAL_TIM_SET_AUTORELOAD(&htim5, 886560 - 1);
+        __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_3, 1200 - 1);
+      } else {
+        // Fast Shutter (20us) - Modes 0 and 1
+        __HAL_TIM_SET_AUTORELOAD(&htim5, 2400 - 1);
+        __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_3, 480 - 1);
+      }
+
+      // 3. Reset Counters
+      __HAL_TIM_SET_COUNTER(&htim2, 0);
+      __HAL_TIM_SET_COUNTER(&htim3, 0);
+      __HAL_TIM_SET_COUNTER(&htim4, 0);
+      __HAL_TIM_SET_COUNTER(&htim5, 0);
+
+      // 4. Restart if Continuous (Mode 0 or 2)
+      if (ccd_mode == 0 || ccd_mode == 2) {
+        __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
+        HAL_ADC_Start_DMA(&hadc1, (uint32_t *)Buffer_A, CCD_BUFFER_SIZE);
+
+        HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3);
+        HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
+        HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+      }
     }
+
+    // --- EXECUTION LOGIC ---
+
+    if (ccd_mode == 1) {
+      // === MODE 1: ONE-SHOT STABLE ===
+
+      // 1. Prepare DMA
+      __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
+      HAL_ADC_Start_DMA(&hadc1, (uint32_t *)Buffer_A, CCD_BUFFER_SIZE);
+
+      // 2. Reset Counters
+      __HAL_TIM_SET_COUNTER(&htim2, 0);
+      __HAL_TIM_SET_COUNTER(&htim4, 0);
+      __HAL_TIM_SET_COUNTER(&htim5, 0);
+
+      // 3. Start Timers
+      HAL_TIM_PWM_Start(&htim5, TIM_CHANNEL_3);
+      HAL_TIM_PWM_Start(&htim4, TIM_CHANNEL_4);
+      HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+
+      // 4. Wait for Frame
+      while (!frame_ready) {
+        if (mode_update_pending)
+          break; // Exit if mode changed
+      }
+
+      // 5. Stop Timers
+      HAL_TIM_PWM_Stop(&htim2, TIM_CHANNEL_1);
+      HAL_TIM_PWM_Stop(&htim5, TIM_CHANNEL_3);
+      HAL_TIM_PWM_Stop(&htim4, TIM_CHANNEL_4);
+
+      if (frame_ready) {
+        frame_ready = 0;
+        Send_CCD_Frame_Binary();
+      }
+
+    } else {
+      // === MODE 0 & 2: CONTINUOUS ===
+
+      // Just wait for interrupt to set flag
+      if (frame_ready) {
+        frame_ready = 0;
+        Send_CCD_Frame_Binary();
+      }
+    }
+
+    // Optional delay
+    // HAL_Delay(1);
 
     /* USER CODE END WHILE */
 
@@ -314,7 +412,7 @@ static void MX_ADC1_Init(void) {
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIG_T4_CC4;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_RISING;
-  hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DMA_CIRCULAR;
+  hadc1.Init.ConversionDataManagement = ADC_CONVERSIONDATA_DMA_ONESHOT;
   hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
   hadc1.Init.LeftBitShift = ADC_LEFTBITSHIFT_NONE;
   hadc1.Init.OversamplingMode = DISABLE;
@@ -541,7 +639,7 @@ static void MX_TIM5_Init(void) {
   htim5.Instance = TIM5;
   htim5.Init.Prescaler = 0;
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim5.Init.Period = 2400 - 1;
+  htim5.Init.Period = 2400 - 1; // 20us integration time (50kHz)
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim5) != HAL_OK) {
@@ -555,7 +653,8 @@ static void MX_TIM5_Init(void) {
     Error_Handler();
   }
   sSlaveConfig.SlaveMode = TIM_SLAVEMODE_RESET;
-  sSlaveConfig.InputTrigger = TIM_TS_ITR0;
+  sSlaveConfig.InputTrigger =
+      TIM_TS_ITR1; // Changed to ITR1 to match TIM4 (TIM2 Master)
   if (HAL_TIM_SlaveConfigSynchro(&htim5, &sSlaveConfig) != HAL_OK) {
     Error_Handler();
   }
@@ -565,7 +664,8 @@ static void MX_TIM5_Init(void) {
     Error_Handler();
   }
   sConfigOC.OCMode = TIM_OCMODE_PWM1;
-  sConfigOC.Pulse = 480 - 1;
+  sConfigOC.Pulse = 480 - 1; // 4us Pulse Width
+
   // TESTING: Changed to LOW for Active-Low at CCD (per TCD1304 datasheet
   // requirement) STM32 outputs LOW during pulse → CCD sees LOW (Active-Low
   // signal)
@@ -663,14 +763,16 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     HAL_IncTick();
   }
   /* USER CODE BEGIN Callback 1 */
-  // TIM2 (ICG) interrupt: Frame complete
-  // Timer math is exact: TIM2 period (886560) / TIM4 period (240) = 3694
-  // samples DMA runs continuously, we just copy the buffer at ICG
-  if (htim->Instance == TIM2) {
-    ccd_frame.magic = 0xABCD;
-    ccd_frame.frame_num = frame_counter++;
-    memcpy(ccd_frame.pixels, (void *)Buffer_A, CCD_BUFFER_SIZE * 2);
-    frame_ready = 1;
+  // TIM2 (ICG) interrupt: Frame Start
+  // This interrupt validates the start of a new frame.
+  if (htim->Instance == TIM2) { // ICG interrupt
+    // Mode 0/2: Continuous - Restart DMA here if using Normal Mode
+    if (ccd_mode != 1) {
+      // Clear OVR
+      __HAL_ADC_CLEAR_FLAG(&hadc1, ADC_FLAG_OVR);
+      // Restart DMA
+      HAL_ADC_Start_DMA(&hadc1, (uint32_t *)Buffer_A, CCD_BUFFER_SIZE);
+    }
   }
   /* USER CODE END Callback 1 */
 }
