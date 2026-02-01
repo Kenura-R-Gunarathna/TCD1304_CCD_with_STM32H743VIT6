@@ -20,9 +20,10 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "usbd_cdc_if.h"
+#include "main.h"
 
 /* USER CODE BEGIN INCLUDE */
-
+#include "main.h"
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -276,9 +277,16 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t *pbuf, uint16_t length) {
  */
 static int8_t CDC_Receive_FS(uint8_t *Buf, uint32_t *Len) {
   /* USER CODE BEGIN 6 */
-  // Binary-only mode: Ignore incoming data, just re-arm receiver
-  (void)Buf;
-  (void)Len;
+  // Simple Command Parser: "M0", "M1", "M2"
+  if (*Len > 0) {
+    if (Buf[0] == 'M' && *Len >= 2) {
+      uint8_t mode = Buf[1] - '0'; // Convert char to int
+      if (mode <= 2) {
+        ccd_mode = mode;
+        mode_update_pending = 1;
+      }
+    }
+  }
 
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);

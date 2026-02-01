@@ -1,0 +1,11 @@
+{
+    "invert_signal": true,
+    "enable_savgol": true,
+    "savgol_window": 18,
+    "frame_average": 1,
+    "peak_threshold": 15000,
+    "peak_min_dist": 100,
+    "last_project": "Default",
+    "remove_dummies": true,
+    "y_max": 50753
+}
